@@ -232,7 +232,8 @@ data class NewsItem(
     @SerialName("feed_type")
     val feedType: Int,
     @SerialName("appid")
-    val appId: Int
+    val appId: Int,
+    val tags: List<String> = emptyList()
 )
 
 // Modified wrapper response classes
