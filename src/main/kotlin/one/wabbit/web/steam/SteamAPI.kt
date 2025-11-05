@@ -457,7 +457,10 @@ data class Movie(
     val thumbnail: String,
     val webm: MovieUrls,
     val mp4: MovieUrls,
-    val highlight: Boolean
+    val highlight: Boolean,
+    val dash_av1: String? = null,
+    val dash_h264: String? = null,
+    val hls_h264: String? = null
 )
 
 @Serializable
