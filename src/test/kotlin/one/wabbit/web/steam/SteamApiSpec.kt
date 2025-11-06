@@ -1,11 +1,11 @@
 package one.wabbit.web.steam
 
-import kotlinx.coroutines.runBlocking
-import kotlin.test.Ignore
 import kotlin.test.Test
+import kotlinx.coroutines.runBlocking
 
 class SteamApiSpec {
-    @Test fun main() {
+    @Test
+    fun main() {
         runBlocking {
             val steamApi = SteamAPI()
 
@@ -13,22 +13,19 @@ class SteamApiSpec {
             val game = steamApi.getGameDetails("374320")
             println("Game: ${game.name}")
 
-//             Get game reviews
-            steamApi.getGameReviews("374320", limit = 10)
-                .collect { review ->
-                    println("Review: ${review.review}")
-                }
+            //             Get game reviews
+            steamApi.getGameReviews("374320", limit = 10).collect { review ->
+                println("Review: ${review.review}")
+            }
 
             // Search for games
-            steamApi.searchGames("Dark Souls", limit = 5)
-                .collect { game ->
-                    println("Found: ${game.name}")
-                }
+            steamApi.searchGames("Dark Souls", limit = 5).collect { game ->
+                println("Found: ${game.name}")
+            }
 
-            steamApi.getGameUpdates("374320", limit = 5, maxLength = 0)
-                .collect { update ->
-                    println("Update: ${update}")
-                }
+            steamApi.getGameUpdates("374320", limit = 5, maxLength = 0).collect { update ->
+                println("Update: $update")
+            }
         }
     }
 }
