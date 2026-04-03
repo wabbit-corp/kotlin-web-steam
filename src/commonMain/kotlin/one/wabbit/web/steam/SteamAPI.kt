@@ -1,17 +1,17 @@
 package one.wabbit.web.steam
 
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.ResponseException
 import io.ktor.client.plugins.HttpTimeout
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.plugins.defaultRequest
+import io.ktor.client.plugins.expectSuccess
+import io.ktor.client.plugins.pluginOrNull
+import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.accept
 import io.ktor.client.request.get
-import io.ktor.client.request.header
 import io.ktor.client.request.parameter
+import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
-import io.ktor.http.contentType
-import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.serialization.KSerializer
@@ -25,123 +25,194 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonDecoder
 import kotlinx.serialization.json.JsonObject
+import one.wabbit.web.common.Etiquette
+import one.wabbit.web.common.Timeouts
+import one.wabbit.web.common.applyEtiquette
+import one.wabbit.web.common.applyTimeouts
+import one.wabbit.web.common.retryingHttpCall
+import one.wabbit.web.common.safeBodyPrefix
+import kotlin.coroutines.cancellation.CancellationException
+import kotlin.jvm.JvmInline
+import kotlin.time.Duration.Companion.seconds
 
-class SteamAPI(
-    private val client: HttpClient = HttpClient {
-        install(ContentNegotiation) { json() }
+sealed class SteamApiError(message: String, cause: Throwable? = null) : Exception(message, cause) {
+    class InvalidInput(message: String) : SteamApiError(message)
 
-        // Configure encoding
-        install(HttpTimeout) {
-            requestTimeoutMillis = 30000
-            connectTimeoutMillis = 30000
-            socketTimeoutMillis = 30000
+    class NotFound(val appId: String) : SteamApiError("Steam app not found for appId=$appId")
+
+    class Api(
+        val url: String,
+        message: String,
+    ) : SteamApiError("Steam API error from $url: $message")
+
+    class Http(
+        val url: String,
+        val status: Int,
+        val bodySample: String?,
+        cause: Throwable? = null,
+    ) : SteamApiError(
+        buildString {
+            append("HTTP ")
+            append(status)
+            append(" from ")
+            append(url)
+            if (!bodySample.isNullOrBlank()) {
+                append(", body sample: ")
+                append(bodySample.take(256))
+            }
+        },
+        cause,
+    )
+
+    class Network(
+        val url: String,
+        cause: Throwable,
+    ) : SteamApiError(
+        "Network failure talking to $url: ${cause::class.simpleName}: ${cause.message}",
+        cause,
+    )
+
+    class Parse(
+        val url: String,
+        val bodySample: String,
+        cause: Throwable,
+    ) : SteamApiError(
+        "Failed to parse Steam response from $url: ${cause::class.simpleName}: ${cause.message}; body sample: ${bodySample.take(256)}",
+        cause,
+    )
+}
+
+interface SteamApi {
+    data class Config(
+        val storeApiBaseUrl: String = "https://store.steampowered.com/api",
+        val reviewsApiBaseUrl: String = "https://store.steampowered.com/appreviews",
+        val newsApiBaseUrl: String = "https://api.steampowered.com/ISteamNews",
+        val etiquette: Etiquette = Etiquette(
+            userAgent = "one.wabbit.web.steam/2.1",
+            extraHeaders = mapOf("Accept-Charset" to "UTF-8"),
+        ),
+        val timeouts: Timeouts = Timeouts(
+            request = 30.seconds,
+            connect = 30.seconds,
+            socket = 30.seconds,
+        ),
+    ) {
+        init {
+            require(storeApiBaseUrl.isNotBlank()) { "storeApiBaseUrl must not be blank" }
+            require(reviewsApiBaseUrl.isNotBlank()) { "reviewsApiBaseUrl must not be blank" }
+            require(newsApiBaseUrl.isNotBlank()) { "newsApiBaseUrl must not be blank" }
         }
-
-        // Configure default request
-        defaultRequest {
-            accept(ContentType.Application.Json)
-            contentType(ContentType.Application.Json)
-
-            // Add required headers
-            header("Accept-Charset", "UTF-8")
-            header("User-Agent", "Steam API Client/1.0")
-        }
-    }
-) {
-    companion object {
-        private const val STEAM_STORE_API = "https://store.steampowered.com/api"
-        private const val STEAM_COMMUNITY_API = "https://steamcommunity.com/api"
-        private const val STEAM_REVIEWS_API = "https://store.steampowered.com/appreviews"
-        private const val STEAM_NEWS_API = "https://api.steampowered.com/ISteamNews"
-
-        private const val DEFAULT_LANGUAGE = "english"
-        private const val DEFAULT_REVIEW_TYPE = "all"
-        private const val DEFAULT_PURCHASE_TYPE = "all"
-        private const val DEFAULT_PAGE_SIZE = 100
     }
 
-    /**
-     * Retrieves game details from Steam
-     *
-     * @param appId The Steam application ID
-     * @return SteamGame object containing game details
-     */
-    suspend fun getGameDetails(appId: String): GameData {
-        val response =
-            client.get("$STEAM_STORE_API/appdetails") { parameter("appids", appId) }.bodyAsText()
-        return Json.decodeFromString<AppDetailsResponse>(response).content[appId]?.data
-            ?: error("Game not found")
-    }
+    suspend fun getGameDetails(appId: String): GameData
 
-    /**
-     * Retrieves reviews for a specific game
-     *
-     * @param appId The Steam application ID
-     * @param limit Maximum number of reviews to retrieve (default: 100)
-     * @param language Review language (default: english)
-     * @param reviewType Type of reviews to retrieve (all, positive, negative)
-     * @param purchaseType Filter by purchase type (all, steam, other)
-     * @return Flow of SteamReview objects
-     */
     fun getGameReviews(
         appId: String,
         limit: Int = 100,
         language: String = DEFAULT_LANGUAGE,
         reviewType: String = DEFAULT_REVIEW_TYPE,
         purchaseType: String = DEFAULT_PURCHASE_TYPE,
-    ): Flow<Review> = flow {
-        var cursor = "*"
-        var remainingReviews = limit
+    ): Flow<Review>
 
-        while (remainingReviews > 0 && cursor != "") {
-            val response =
-                client.get("$STEAM_REVIEWS_API/$appId") {
+    fun searchGames(query: String, limit: Int = DEFAULT_PAGE_SIZE): Flow<GameData>
+
+    fun getFeaturedCategories(limit: Int = DEFAULT_PAGE_SIZE): Flow<UpdatedGameData>
+
+    fun getGameUpdates(appId: String, limit: Int = 20, maxLength: Int? = null): Flow<NewsItem>
+
+    companion object {
+        const val DEFAULT_LANGUAGE: String = "english"
+        const val DEFAULT_REVIEW_TYPE: String = "all"
+        const val DEFAULT_REVIEW_FILTER: String = "all"
+        const val DEFAULT_PURCHASE_TYPE: String = "all"
+        const val DEFAULT_PAGE_SIZE: Int = 100
+    }
+}
+
+class KtorSteamApi(
+    private val httpClient: HttpClient,
+    val config: SteamApi.Config = SteamApi.Config(),
+) : SteamApi {
+    private val json = Json {
+        ignoreUnknownKeys = true
+        explicitNulls = false
+    }
+
+    init {
+        check(runCatching { httpClient.pluginOrNull(HttpTimeout) }.getOrNull() != null) {
+            "HttpTimeout plugin must be installed on the provided HttpClient for per-request timeouts to work."
+        }
+    }
+
+    override suspend fun getGameDetails(appId: String): GameData {
+        val normalizedAppId = requireAppId(appId)
+        val response =
+            getJson<AppDetailsResponse>("${config.storeApiBaseUrl}/appdetails") {
+                parameter("appids", normalizedAppId)
+            }
+
+        val game = response.content[normalizedAppId]
+        if (game?.success != true || game.data == null) {
+            throw SteamApiError.NotFound(normalizedAppId)
+        }
+
+        return game.data
+    }
+
+    override fun getGameReviews(
+        appId: String,
+        limit: Int,
+        language: String,
+        reviewType: String,
+        purchaseType: String,
+    ): Flow<Review> = flow {
+        val normalizedAppId = requireAppId(appId)
+        val normalizedLanguage = requireNonBlank(language, "language")
+        val normalizedReviewType = requireNonBlank(reviewType, "reviewType")
+        val normalizedPurchaseType = requireNonBlank(purchaseType, "purchaseType")
+        var cursor = "*"
+        var remainingReviews = requirePositive(limit, "limit")
+        val url = "${config.reviewsApiBaseUrl}/$normalizedAppId"
+
+        while (remainingReviews > 0 && cursor.isNotEmpty()) {
+            val requestCursor = cursor
+            val responseData =
+                getJson<ReviewResponse>(url) {
                     parameter("json", 1)
-                    parameter("cursor", cursor)
-                    parameter("language", language)
-                    parameter("filter", reviewType) // changed from review_type
-                    parameter("purchase_type", purchaseType)
-                    parameter("day_range", 365) // optional: limit to recent reviews
+                    parameter("cursor", requestCursor)
+                    parameter("language", normalizedLanguage)
+                    parameter("filter", SteamApi.DEFAULT_REVIEW_FILTER)
+                    parameter("purchase_type", normalizedPurchaseType)
+                    parameter("review_type", normalizedReviewType)
+                    parameter("day_range", 365)
                     parameter("num_per_page", minOf(100, remainingReviews))
-                    parameter("review_type", "all") // can be "all", "positive", "negative"
                     parameter("start_offset", 0)
                 }
-            println(response.status)
 
-            val responseText = response.bodyAsText()
-            println(responseText)
+            if (!responseData.success) {
+                throw SteamApiError.Api(url, "review response reported success=0")
+            }
 
-            val responseData = Json.decodeFromString<ReviewResponse>(responseText)
-
-            responseData.reviews.forEach { review -> emit(review) }
-
+            responseData.reviews.take(remainingReviews).forEach { review -> emit(review) }
             remainingReviews -= responseData.reviews.size
+            if (responseData.reviews.isEmpty() || responseData.cursor == requestCursor) {
+                break
+            }
             cursor = responseData.cursor
         }
     }
 
-    /**
-     * Searches for games on Steam
-     *
-     * @param query Search query
-     * @param limit Maximum number of results
-     * @return Flow of SteamGame objects
-     */
-    fun searchGames(query: String, limit: Int = DEFAULT_PAGE_SIZE): Flow<GameData> = flow {
+    override fun searchGames(query: String, limit: Int): Flow<GameData> = flow {
+        val normalizedQuery = requireNonBlank(query, "query")
         var page = 1
-        var remainingGames = limit
+        var remainingGames = requirePositive(limit, "limit")
 
         while (remainingGames > 0) {
-            val response =
-                client.get("$STEAM_STORE_API/storesearch") {
-                    parameter("term", query)
+            val responseData =
+                getJson<SearchResponse>("${config.storeApiBaseUrl}/storesearch") {
+                    parameter("term", normalizedQuery)
                     parameter("page", page)
                 }
-
-            val responseText = response.bodyAsText()
-            println(responseText)
-
-            val responseData = Json.decodeFromString<SearchResponse>(responseText)
 
             responseData.items.take(remainingGames).forEach { game ->
                 emit(getGameDetails(game.id))
@@ -153,27 +224,22 @@ class SteamAPI(
         }
     }
 
-    /**
-     * Retrieves recently updated games
-     *
-     * @param limit Maximum number of games to retrieve
-     * @return Flow of SteamGame objects
-     */
-    fun getFeaturedCategories(limit: Int = DEFAULT_PAGE_SIZE): Flow<UpdatedGameData> = flow {
+    override fun getFeaturedCategories(limit: Int): Flow<UpdatedGameData> = flow {
         var page = 1
-        var remainingGames = limit
+        var remainingGames = requirePositive(limit, "limit")
 
         while (remainingGames > 0) {
-            val response =
-                client.get("$STEAM_STORE_API/featuredcategories/updated") {
+            val responseData =
+                getJson<UpdatedGamesResponse>("${config.storeApiBaseUrl}/featuredcategories/updated") {
                     parameter("page", page)
                 }
 
-            val responseText = response.bodyAsText()
-
-            println(responseText)
-
-            val responseData = Json.decodeFromString<UpdatedGamesResponse>(responseText)
+            if (!responseData.success) {
+                throw SteamApiError.Api(
+                    "${config.storeApiBaseUrl}/featuredcategories/updated",
+                    "featured categories response reported success=false",
+                )
+            }
 
             responseData.apps.take(remainingGames).forEach { game -> emit(game) }
 
@@ -183,31 +249,89 @@ class SteamAPI(
         }
     }
 
-    /**
-     * Retrieves news and updates for a specific game
-     *
-     * @param appId The Steam application ID
-     * @param limit Number of news items to retrieve (default: 20)
-     * @param maxLength Maximum length of news content (default: 0 for full length)
-     * @return Flow of news items/updates
-     */
-    fun getGameUpdates(appId: String, limit: Int = 20, maxLength: Int? = null): Flow<NewsItem> =
+    override fun getGameUpdates(appId: String, limit: Int, maxLength: Int?): Flow<NewsItem> =
         flow {
-            val response =
-                client.get("$STEAM_NEWS_API/GetNewsForApp/v2/") {
-                    parameter("appid", appId)
-                    parameter("count", limit)
-                    maxLength?.let { parameter("maxlength", it) }
-                    //            parameter("feeds", "steam_updates")  // This specifically gets
-                    // update news
-                }
+            val normalizedAppId = requireAppId(appId)
+            val normalizedLimit = requirePositive(limit, "limit")
+            if (maxLength != null && maxLength < 0) {
+                throw SteamApiError.InvalidInput("maxLength must be non-negative if provided")
+            }
 
-            val responseText = response.bodyAsText()
-            println(responseText)
-            val newsData = Json.decodeFromString<NewsResponse>(responseText)
+            val newsData =
+                getJson<NewsResponse>("${config.newsApiBaseUrl}/GetNewsForApp/v2/") {
+                    parameter("appid", normalizedAppId)
+                    parameter("count", normalizedLimit)
+                    maxLength?.let { parameter("maxlength", it) }
+                }
 
             newsData.appnews.newsitems.forEach { newsItem -> emit(newsItem) }
         }
+
+    private suspend inline fun <reified T> getJson(
+        url: String,
+        crossinline configure: HttpRequestBuilder.() -> Unit = {},
+    ): T {
+        val response = try {
+            retryingHttpCall {
+                httpClient.get(url) {
+                    expectSuccess = true
+                    applyEtiquette(config.etiquette)
+                    applyTimeouts(config.timeouts)
+                    accept(ContentType.Application.Json)
+                    configure()
+                }
+            }
+        } catch (t: Throwable) {
+            throw t.toSteamError(url)
+        }
+
+        return response.decodeJson(url)
+    }
+
+    private suspend inline fun <reified T> HttpResponse.decodeJson(url: String): T {
+        val body = try {
+            bodyAsText()
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            throw SteamApiError.Network(url, t)
+        }
+
+        return try {
+            json.decodeFromString<T>(body)
+        } catch (t: Throwable) {
+            if (t is CancellationException) throw t
+            throw SteamApiError.Parse(url, body.take(2048), t)
+        }
+    }
+
+    private fun requireAppId(appId: String): String = requireNonBlank(appId, "appId")
+
+    private fun requireNonBlank(value: String, name: String): String {
+        val normalized = value.trim()
+        if (normalized.isEmpty()) {
+            throw SteamApiError.InvalidInput("$name must not be blank")
+        }
+        return normalized
+    }
+
+    private fun requirePositive(value: Int, name: String): Int {
+        if (value <= 0) {
+            throw SteamApiError.InvalidInput("$name must be positive")
+        }
+        return value
+    }
+}
+
+typealias SteamAPI = KtorSteamApi
+
+private suspend fun Throwable.toSteamError(url: String): SteamApiError {
+    if (this is CancellationException) throw this
+    return if (this is ResponseException) {
+        val sample = runCatching { response.safeBodyPrefix(2048) }.getOrNull()
+        SteamApiError.Http(url, response.status.value, sample, this)
+    } else {
+        SteamApiError.Network(url, this)
+    }
 }
 
 @Serializable data class NewsResponse(val appnews: AppNews)
