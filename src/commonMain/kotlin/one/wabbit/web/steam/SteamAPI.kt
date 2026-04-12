@@ -29,8 +29,8 @@ import one.wabbit.web.common.Etiquette
 import one.wabbit.web.common.Timeouts
 import one.wabbit.web.common.applyEtiquette
 import one.wabbit.web.common.applyTimeouts
-import one.wabbit.web.common.retryingHttpCall
-import one.wabbit.web.common.safeBodyPrefix
+import one.wabbit.web.common.responseBodySampleOrNull
+import one.wabbit.web.common.retryingIdempotentHttpCall
 import kotlin.coroutines.cancellation.CancellationException
 import kotlin.jvm.JvmInline
 import kotlin.time.Duration.Companion.seconds
@@ -272,7 +272,7 @@ class KtorSteamApi(
         crossinline configure: HttpRequestBuilder.() -> Unit = {},
     ): T {
         val response = try {
-            retryingHttpCall {
+            retryingIdempotentHttpCall {
                 httpClient.get(url) {
                     expectSuccess = true
                     applyEtiquette(config.etiquette)
@@ -327,7 +327,7 @@ typealias SteamAPI = KtorSteamApi
 private suspend fun Throwable.toSteamError(url: String): SteamApiError {
     if (this is CancellationException) throw this
     return if (this is ResponseException) {
-        val sample = runCatching { response.safeBodyPrefix(2048) }.getOrNull()
+        val sample = responseBodySampleOrNull()
         SteamApiError.Http(url, response.status.value, sample, this)
     } else {
         SteamApiError.Network(url, this)
