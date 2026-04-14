@@ -10,5 +10,6 @@ Add repo-specific instructions above or below the managed facts block. Keep manu
 - Canonical repo target: `kotlin-web-steam`. Useful entrypoints: `dev project show kotlin-web-steam`, `dev build kotlin-web-steam`, `dev check kotlin-web-steam`.
 - Setup-managed files are regenerated with `dev setup kotlin-web-steam`; avoid hand-editing stamped generated files.
 - Sanctioned override files in this repo: `build.extra.gradle.kts`, `settings.local.gradle.kts`.
+- Review `kotlin-conventions.md` before editing Kotlin code in this repo.
 - Configured project types: `kotlin/kmp`. Docs: `dokka`.
 <!-- END app-wabbit-dev managed facts -->
